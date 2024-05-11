@@ -1,3 +1,8 @@
+> [!IMPORTANT]
+> This is a fork of the original SyntheMol found [here](https://github.com/swansonk14/SyntheMol/tree/main).
+> 
+> This fork is being worked on as part of a class project for Stanford's CS273B by Sina Mollaei, Cristobal Garcia, and Ashish Thakur.
+
 # SyntheMol: Generative AI for Drug Discovery
 
 [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/synthemol)](https://badge.fury.io/py/synthemol)
