@@ -139,3 +139,6 @@ dmypy.json
 /generations
 /models
 /synthemol/files
+
+
+diffdock_output

@@ -5,6 +5,17 @@ from pathlib import Path
 import pandas as pd
 from tap import tapify
 
+import torch
+from rdkit import Chem
+from torch_geometric.data import Data
+from torch_geometric.nn import GCNConv, global_mean_pool
+import torch.nn.functional as F
+
+import os
+import glob
+import requests
+from time import sleep
+
 from synthemol.constants import (
     BUILDING_BLOCKS_PATH,
     FINGERPRINT_TYPES,
@@ -22,7 +33,93 @@ from synthemol.reactions import (
     set_all_building_blocks
 )
 from synthemol.generate.generator import Generator
-from synthemol.generate.utils import create_model_scoring_fn, save_generated_molecules
+from synthemol.generate.utils import save_generated_molecules
+
+
+class GCN(torch.nn.Module):
+    def __init__(self, num_features):
+        super(GCN, self).__init__()
+        self.conv1 = GCNConv(num_features, 16)
+        self.conv2 = GCNConv(16, 1)
+        self.pool = global_mean_pool
+
+    def forward(self, data):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.dropout(x, training=self.training)
+        x = self.conv2(x, edge_index)
+        x = self.pool(x, batch)
+        return torch.sigmoid(x)
+
+def get_atom_features(mol):
+    features = []
+    for atom in mol.GetAtoms():
+        atomic_num = atom.GetAtomicNum()
+        aromatic = atom.GetIsAromatic()
+        chirality = atom.GetChiralTag()
+        formal_charge = atom.GetFormalCharge()
+        num_hydrogens = atom.GetTotalNumHs()
+        num_valence = atom.GetTotalValence()
+        hybridization = atom.GetHybridization()
+        is_in_ring = atom.IsInRing()
+
+        hybridization = {
+            Chem.rdchem.HybridizationType.SP: 1,
+            Chem.rdchem.HybridizationType.SP2: 2,
+            Chem.rdchem.HybridizationType.SP3: 3,
+            Chem.rdchem.HybridizationType.SP3D: 4,
+            Chem.rdchem.HybridizationType.SP3D2: 5,
+            Chem.rdchem.HybridizationType.UNSPECIFIED: 0
+        }.get(hybridization, 0)
+
+        feature_vector = [
+            atomic_num,
+            int(aromatic),
+            int(chirality != Chem.ChiralType.CHI_UNSPECIFIED),
+            formal_charge,
+            num_hydrogens,
+            num_valence,
+            hybridization,
+            int(is_in_ring)
+        ]
+        features.append(feature_vector)
+
+    return features
+
+def molecule_to_graph(mol):
+    bonds = mol.GetBonds()
+
+    node_features = get_atom_features(mol)
+    edge_index = []
+    edge_features = []
+
+    for bond in bonds:
+        start, end = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        edge_index.append((start, end))
+        edge_index.append((end, start))
+        edge_features += [bond.GetBondTypeAsDouble(), bond.GetBondTypeAsDouble()]
+
+    node_features = torch.tensor(node_features, dtype=torch.float)
+    edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+    edge_features = torch.tensor(edge_features, dtype=torch.float)
+
+    return Data(x=node_features, edge_index=edge_index, edge_attr=edge_features)
+
+def load_model(model_path, num_features):
+    model = GCN(num_features=num_features)
+    model.load_state_dict(torch.load(model_path))
+    model.eval()
+    return model
+
+def predict_activity(sdf_path, model):
+    mol = Chem.MolFromMolFile(sdf_path)
+    graph = molecule_to_graph(mol)
+    graph.batch = torch.zeros(graph.num_nodes, dtype=torch.long)  # Add batch attribute
+    graph = graph.to(torch.device('cpu'))
+    model.eval()
+    with torch.no_grad():
+        output = model(graph).item()
+    return output
 
 
 def generate(
@@ -133,12 +230,67 @@ def generate(
 
     # Define model scoring function
     print('Loading models and creating model scoring function...')
-    model_scoring_fn = create_model_scoring_fn(
-        model_path=model_path,
-        model_type=model_type,
-        fingerprint_type=fingerprint_type,
-        smiles_to_score=building_block_smiles_to_score
-    )
+    # model_scoring_fn = create_model_scoring_fn(
+    #     model_path=model_path,
+    #     model_type=model_type,
+    #     fingerprint_type=fingerprint_type,
+    #     smiles_to_score=building_block_smiles_to_score
+    # )
+    
+    model_path = 'gcn_model.pth'
+    num_features = 8
+    model = load_model(model_path, num_features)
+    
+    def model_scoring_fn(smiles_str: str) -> float:
+        """
+        1. Calls diffdock on the molecule with GLP-1 and gets an outputted SDF file
+        2. Passes this SDF file into a pretrained model to get a score 0-1
+
+        Args:
+            smiles (str): SMILES string of the ligand
+
+        Returns:
+            float: Predicted activity score
+        """
+        
+        if smiles_str == 'c':
+            return 0.54
+        
+        print("Making call to diffdock...")
+        url = "http://localhost:8080/diffdock"
+        payload = {
+            "smiles": smiles_str
+        }
+
+        # Send the POST request
+        response = requests.get(url, json=payload)
+
+        # Check the response
+        if response.status_code == 200:
+            print("Request was successful.")
+            print("Response:", response.json())
+        else:
+            print("Request failed with status code:", response.status_code)
+            print("Response:", response.text)
+        print('Call to diffdock concluded')
+        
+        # Locate the SDF file with "rank1_confidence" in its name
+        sdf_path = ''
+        output_dir = os.path.join('C:/Users/ashis/Downloads/SyntheMol/SyntheMol/diffdock_output', smiles_str)
+        sleep(8)
+        sdf_files = glob.glob(os.path.join(output_dir, '*rank1_confidence*.sdf'))
+        if sdf_files:
+            sdf_path = sdf_files[0]
+        else:
+            sdf_files = glob.glob(os.path.join(output_dir, '*rank1*.sdf'))
+            if not sdf_files:
+                return 0.54
+        
+        # Pass the SDF path to the predict_activity function
+        score = predict_activity(sdf_path, model)
+        print(f'Predicted activity score: {score}')
+        
+        return score
 
     # Set up Generator
     print('Setting up generator...')
