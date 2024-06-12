@@ -142,3 +142,7 @@ dmypy.json
 
 
 diffdock_output
+
+DiffDock/diffdock_chembl_output
+DiffDock/best
+DiffDock/csv_output
